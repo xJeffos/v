@@ -115,13 +115,15 @@
   }
 
   let question = null;               /* question actuellement ouverte */
+  let libelle  = '';                 /* ce que la presentation affiche : 'Q9' */
   let ouverte  = false;
   let monVote  = null;               /* mon choix pour CETTE question */
   let envoiEnCours = false;
   let enAttente = null;              /* minuterie du prochain tour de lecture */
 
   function affiche() {
-    const n = question ? String(parseInt(question.replace(/\D/g, ''), 10) || '') : '';
+    /* Le libelle vient de la presentation : le deduire de l'identifiant donnerait un
+       numero faux des qu'un ecran est saute en version courte. */
     if (!question || !ouverte) {
       titre.textContent = 'En attente';
       etat.textContent = question ? 'Vote clos pour cette question.'
@@ -130,7 +132,7 @@
       choix.hidden = true;
       return;
     }
-    titre.textContent = 'Question ' + n;
+    titre.textContent = libelle ? 'Question ' + libelle.replace(/^Q/i, '') : 'À vous';
     choix.hidden = false;
     btns.forEach(b => {
       const actif = b.dataset.c === monVote;
@@ -153,7 +155,7 @@
 
   /* --- quelle question est ouverte ? relu toutes les 2 s -------------------- */
   async function etatSondage() {
-    const r = await fetch(REST + '/poll_state?id=eq.main&select=active_question,is_open',
+    const r = await fetch(REST + '/poll_state?id=eq.main&select=active_question,active_label,is_open',
                           { headers: HEAD, cache: 'no-store' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const l = await r.json();
@@ -167,6 +169,7 @@
         question = s.active_question;
         monVote = null;                       /* on ne reporte jamais un vote */
       }
+      libelle = s.active_label || '';
       ouverte = !!s.is_open;
       reseau(true);
       affiche();
