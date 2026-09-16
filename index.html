@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="fr">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vote — atelier BPG</title>
+<!-- ===================================================================
+     Page de vote, ouverte une fois par participant en scannant le QR.
+
+     Elle n'affiche QUE le numero de la question et quatre boutons : aucun
+     enonce, aucune option, aucune reponse. C'est ce qui permet a la
+     presentation de ne rien envoyer de son contenu. Les participants lisent
+     la question a l'ecran projete.
+
+     Aucune bibliotheque, aucun CDN : rien que fetch sur l'API REST. La
+     question active est relue toutes les 2 secondes, ce qui traverse
+     n'importe quel proxy la ou un WebSocket serait souvent filtre.
+     =================================================================== -->
+<script>
+  /* ---- A RENSEIGNER : les deux valeurs du projet Supabase -------------
+     URL et cle anon se trouvent dans Project Settings > API.
+     La cle anon est PUBLIQUE par conception : elle n'autorise que ce que
+     les regles RLS permettent, c'est-a-dire deposer un vote sur la question
+     ouverte. Elle ne permet pas de lire les resultats.                   */
+  const SUPABASE_URL = 'https://kyfowgjovrfvonfkmsdx.supabase.co';
+  const SUPABASE_ANON_KEY = 'sb_publishable_07egplVtKNg0qVYOsLjc4g_cK8_qfb6';
+  /* -------------------------------------------------------------------- */
+</script>
+<style>
+  :root{
+    --blue:#001A70; --orange:#FF5A00; --ok:#0E7C4A; --ink:#11172B; --muted:#5B6577;
+    --line:#DCE2EE; --paper:#fff; --paper2:#F4F7FC;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+    --mono:ui-monospace,Menlo,Consolas,monospace;
+    color-scheme:light;
+  }
+  *{ box-sizing:border-box }
+  html,body{ height:100% }
+  body{
+    margin:0; font-family:var(--sans); color:var(--ink); background:var(--paper2);
+    display:flex; flex-direction:column;
+    padding:env(safe-area-inset-top,0) 16px env(safe-area-inset-bottom,0);
+    -webkit-text-size-adjust:100%;
+  }
+  header{ padding:18px 0 10px; text-align:center }
+  .eyebrow{ font:700 11px/1 var(--mono); letter-spacing:.14em; text-transform:uppercase;
+            color:var(--muted); margin:0 0 8px }
+  h1{ font-size:clamp(26px,8vw,36px); margin:0; color:var(--blue); line-height:1.1 }
+  .state{ margin:10px 0 0; font-size:15px; color:var(--muted); min-height:22px }
+  .state--ok{ color:var(--ok); font-weight:700 }
+
+  main{ flex:1; display:grid; grid-template-columns:1fr 1fr; gap:12px;
+        align-content:center; padding:12px 0 20px; max-width:520px; width:100%; margin:0 auto }
+  button.c{
+    font:800 clamp(38px,13vw,64px)/1 var(--sans); color:var(--blue);
+    background:var(--paper); border:2px solid var(--line); border-radius:18px;
+    min-height:clamp(96px,26vh,160px); cursor:pointer; touch-action:manipulation;
+    transition:transform .08s, border-color .2s, background .2s, color .2s;
+    -webkit-tap-highlight-color:transparent;
+  }
+  button.c:active{ transform:scale(.97) }
+  button.c[aria-pressed="true"]{ background:var(--blue); color:#fff; border-color:var(--blue) }
+  button.c:disabled{ opacity:.38; cursor:default }
+
+  footer{ padding:0 0 16px; text-align:center; font-size:12px; color:var(--muted) }
+  .dot{ display:inline-block; width:7px; height:7px; border-radius:50%;
+        background:var(--ok); margin-right:6px; vertical-align:middle }
+  .dot--ko{ background:var(--muted) }
+  @media (prefers-color-scheme:dark){
+    :root{ --ink:#E7ECF7; --paper:#151B2E; --paper2:#0C1120; --line:#2A3350; --muted:#8794BC;
+           --blue:#9DB2F0; color-scheme:dark }
+  }
+</style>
+
+<header>
+  <p class="eyebrow">Atelier BPG · jonction en T</p>
+  <h1 id="titre">Connexion…</h1>
+  <p class="state" id="etat"></p>
+</header>
+
+<main id="choix" hidden>
+  <button class="c" data-c="A" aria-pressed="false">A</button>
+  <button class="c" data-c="B" aria-pressed="false">B</button>
+  <button class="c" data-c="C" aria-pressed="false">C</button>
+  <button class="c" data-c="D" aria-pressed="false">D</button>
+</main>
+
+<footer><span class="dot" id="lien"></span><span id="pied">vote anonyme</span></footer>
+
+<script>
+(function () {
+  'use strict';
+
+  const REST = SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1';
+  const HEAD = { apikey: SUPABASE_ANON_KEY, Authorization: 'Bearer ' + SUPABASE_ANON_KEY };
+
+  const titre = document.getElementById('titre');
+  const etat  = document.getElementById('etat');
+  const choix = document.getElementById('choix');
+  const lien  = document.getElementById('lien');
+  const pied  = document.getElementById('pied');
+  const btns  = [...document.querySelectorAll('button.c')];
+
+  /* Identifiant anonyme, tire au hasard sur l'appareil et garde pour la seance.
+     Il ne contient rien : ni nom, ni appareil, ni reseau. */
+  let voter;
+  try {
+    voter = localStorage.getItem('bpg_voter');
+    if (!voter) {
+      voter = (crypto.randomUUID ? crypto.randomUUID()
+                                 : String(Date.now()) + Math.random().toString(36).slice(2));
+      localStorage.setItem('bpg_voter', voter);
+    }
+  } catch (e) {                      /* navigation privee : l'id vit le temps de l'onglet */
+    voter = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()));
+  }
+
+  let question = null;               /* question actuellement ouverte */
+  let ouverte  = false;
+  let monVote  = null;               /* mon choix pour CETTE question */
+  let envoiEnCours = false;
+  let enAttente = null;              /* minuterie du prochain tour de lecture */
+
+  function affiche() {
+    const n = question ? String(parseInt(question.replace(/\D/g, ''), 10) || '') : '';
+    if (!question || !ouverte) {
+      titre.textContent = 'En attente';
+      etat.textContent = question ? 'Vote clos pour cette question.'
+                                  : 'La prochaine question arrive.';
+      etat.className = 'state';
+      choix.hidden = true;
+      return;
+    }
+    titre.textContent = 'Question ' + n;
+    choix.hidden = false;
+    btns.forEach(b => {
+      const actif = b.dataset.c === monVote;
+      b.setAttribute('aria-pressed', actif ? 'true' : 'false');
+      b.disabled = false;
+    });
+    if (monVote) {
+      etat.textContent = 'Vote pris en compte — modifiable';
+      etat.className = 'state state--ok';
+    } else {
+      etat.textContent = 'Choisissez une réponse';
+      etat.className = 'state';
+    }
+  }
+
+  function reseau(ok, message) {
+    lien.className = 'dot' + (ok ? '' : ' dot--ko');
+    pied.textContent = message || 'vote anonyme';
+  }
+
+  /* --- quelle question est ouverte ? relu toutes les 2 s -------------------- */
+  async function etatSondage() {
+    const r = await fetch(REST + '/poll_state?id=eq.main&select=active_question,is_open',
+                          { headers: HEAD, cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const l = await r.json();
+    return l[0] || { active_question: null, is_open: false };
+  }
+
+  async function boucle() {
+    try {
+      const s = await etatSondage();
+      if (s.active_question !== question) {   /* la presentation a change d'ecran */
+        question = s.active_question;
+        monVote = null;                       /* on ne reporte jamais un vote */
+      }
+      ouverte = !!s.is_open;
+      reseau(true);
+      affiche();
+    } catch (e) {
+      reseau(false, 'reconnexion…');
+    }
+    clearTimeout(enAttente);
+    enAttente = setTimeout(boucle, 2000);
+  }
+
+  /* --- envoyer ou modifier son vote ---------------------------------------- */
+  async function vote(choice) {
+    if (!question || !ouverte || envoiEnCours) return;
+    const avant = monVote;
+    monVote = choice; affiche();               /* retour immediat au doigt */
+    envoiEnCours = true;
+    try {
+      /* On passe par la fonction cast_vote, pas par la table : elle verifie elle-meme
+         que la question est ouverte, et permet le changement d'avis sans qu'il faille
+         donner a ce telephone le droit de lire les votes. */
+      const r = await fetch(REST + '/rpc/cast_vote', {
+        method: 'POST',
+        headers: Object.assign({}, HEAD, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ p_question: question, p_voter: voter, p_choice: choice })
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      reseau(true);
+    } catch (e) {
+      monVote = avant;                         /* le vote n'est pas passe : on le dit */
+      affiche();
+      etat.textContent = 'Vote non enregistré — réessayez';
+      etat.className = 'state';
+      reseau(false, 'envoi impossible');
+    } finally {
+      envoiEnCours = false;
+    }
+  }
+
+  btns.forEach(b => b.addEventListener('click', () => vote(b.dataset.c)));
+
+  /* Un onglet en arriere-plan, ou un telephone en veille, voit ses minuteries
+     bridees par le navigateur : au retour a l'ecran, on relit tout de suite plutot
+     que d'attendre le prochain tour. */
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) relance();
+  });
+  window.addEventListener('focus', relance);
+
+  function relance() {
+    clearTimeout(enAttente);
+    enAttente = setTimeout(boucle, 0);
+  }
+
+  affiche();
+  boucle();
+})();
+</script>
+</html>
